@@ -56,6 +56,23 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		ReasoningEffort:     effort,
 		PromptCacheKey:      chatManage.SessionID,
 	}
+	// Reasoning models spend the completion budget on thinking before they
+	// write answer text, and a budget sized for plain completion (the 1024
+	// config default) ends as finish_reason=length with an empty answer. When
+	// the caller explicitly asked for thinking on, lift a small budget to a
+	// floor where an answer can still fit. Models that think by default
+	// without an explicit request are covered by the empty-answer retry in
+	// the stream plugin.
+	if level, requested := opt.Reasoning(); requested && level.Enabled() {
+		if budget := opt.CompletionBudget(); budget > 0 && budget < thinkingCompletionFloorTokens {
+			pipelineInfo(ctx, "Stream", "thinking_budget_floor", map[string]interface{}{
+				"configured": budget,
+				"floor":      thinkingCompletionFloorTokens,
+			})
+			opt.MaxTokens = 0
+			opt.MaxCompletionTokens = thinkingCompletionFloorTokens
+		}
+	}
 	if level, requested := opt.Reasoning(); requested {
 		pipelineInfo(ctx, "Stream", "thinking_option", map[string]interface{}{
 			"enabled": level.Enabled(),

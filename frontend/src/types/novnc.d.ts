@@ -17,7 +17,7 @@ declare module '@novnc/novnc' {
 
   export interface RFBOptions {
     /**
-     * Not used by WeKnora: the desktop authenticates one hop out, on
+     * Not used by LinkMind: the desktop authenticates one hop out, on
      * websockify, and the RFB security type is None. Declared so a future
      * reader can see that leaving it out is a decision, not an omission.
      */

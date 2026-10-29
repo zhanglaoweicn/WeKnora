@@ -994,7 +994,7 @@ export function getSandboxConfigInventory(id: string): Promise<{ data: SandboxIn
 
 /**
  * Fetch templates using the connection currently entered in the drawer.
- * `ensure_standard` starts a provider-side CLI build when that WeKnora
+ * `ensure_standard` starts a provider-side CLI build when that LinkMind
  * template is missing. `ensure_desktop` does the same for the XFCE image, but
  * the settings UI only sends it when the admin clicks Create — listing must
  * not provision a desktop template as a side effect. `replace_standard` /

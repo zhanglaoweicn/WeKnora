@@ -150,12 +150,49 @@ async def install_ssrf_route_guard(page: Page) -> None:
     await page.route("**/*", handle_route)
 
 
+# Browser launch preference for headless scraping. The app distribution does
+# NOT bundle playwright-managed browser binaries, so prefer browsers already
+# present on the host: Windows 10/11 ship Edge, many machines have Chrome.
+# Playwright-managed Chromium and WebKit remain as fallbacks for the Docker
+# deployment where `playwright install` has been run.
+_LAUNCH_CHANNELS = ("msedge", "chrome")
+
+
+async def _launch_browser(p, kwargs):
+    """Launch the first usable browser backend: system Edge/Chrome, then
+    playwright-managed Chromium, then WebKit (original behaviour)."""
+    errors = []
+    for channel in _LAUNCH_CHANNELS:
+        try:
+            logger.info(f"Launching browser channel: {channel}")
+            return await p.chromium.launch(channel=channel, **kwargs)
+        except Exception as e:
+            errors.append(f"{channel}: {e}")
+            logger.warning(f"Browser channel {channel} unavailable: {e}")
+    try:
+        logger.info("Launching playwright-managed Chromium")
+        return await p.chromium.launch(**kwargs)
+    except Exception as e:
+        errors.append("chromium: {e}")
+        logger.warning(f"Playwright-managed Chromium unavailable: {e}")
+    logger.info("Launching WebKit browser (last fallback)")
+    try:
+        return await p.webkit.launch(**kwargs)
+    except Exception as e:
+        errors.append(f"webkit: {e}")
+        raise RuntimeError(
+            "no usable browser backend (install Edge/Chrome or run "
+            "'playwright install'): " + "; ".join(errors)
+        ) from e
+
+
 class StdWebParser(BaseParser):
     """Standard web page parser using Playwright and Trafilatura.
 
-    This parser scrapes web pages using Playwright's WebKit browser and extracts
-    clean content using Trafilatura library. It supports proxy configuration and
-    converts HTML content to markdown format.
+    This parser scrapes web pages with a headless browser (system Edge/Chrome
+    when available, falling back to playwright-managed browsers) and extracts
+    clean content using Trafilatura library. It supports proxy configuration
+    and converts HTML content to markdown format.
     """
 
     def __init__(self, title: str, **kwargs):
@@ -192,8 +229,7 @@ class StdWebParser(BaseParser):
         try:
             async with SSRFProxy(self.proxy) as proxy, async_playwright() as p:
                 kwargs = {"proxy": {"server": proxy.url, "bypass": ""}}
-                logger.info("Launching WebKit browser")
-                browser = await p.webkit.launch(**kwargs)
+                browser = await _launch_browser(p, kwargs)
                 page = await browser.new_page(service_workers="block")
                 await install_ssrf_route_guard(page)
 

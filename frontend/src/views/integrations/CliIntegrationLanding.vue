@@ -82,7 +82,7 @@ const { apiBaseUrlDisplay } = useApiBaseUrlDisplay()
 const steps = computed(() => [
   {
     key: 'install',
-    command: 'git clone https://github.com/Tencent/WeKnora.git\ncd WeKnora/cli\ngo build -o weknora .\nexport PATH="$PWD:$PATH"',
+    command: 'git clone https://github.com/Tencent/WeKnora.git\ncd LinkMind/cli\ngo build -o weknora .\nexport PATH="$PWD:$PATH"',
   },
   { key: 'connect', command: buildCLIConnectCommand(apiBaseUrlDisplay.value, window.location.origin) },
   { key: 'verify', command: 'weknora doctor\nweknora kb list' },

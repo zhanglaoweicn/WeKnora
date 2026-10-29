@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/event"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -95,6 +96,42 @@ type stubModelService struct {
 
 func (s *stubModelService) GetChatModel(context.Context, string) (chat.Chat, error) {
 	return s.model, nil
+}
+
+// scriptedStreamChat serves one preloaded chunk list per ChatStream call and
+// records the options each call received, so a retry can be asserted on both
+// the model output and the request the retry carried.
+type scriptedStreamChat struct {
+	calls [][]types.StreamResponse
+	opts  []*chat.ChatOptions
+}
+
+func (m *scriptedStreamChat) Chat(context.Context, []chat.Message, *chat.ChatOptions) (*types.ChatResponse, error) {
+	return nil, nil
+}
+
+func (m *scriptedStreamChat) ChatStream(
+	_ context.Context, _ []chat.Message, opts *chat.ChatOptions,
+) (<-chan types.StreamResponse, error) {
+	i := len(m.opts)
+	m.opts = append(m.opts, opts)
+	ch := make(chan types.StreamResponse, len(m.calls[i]))
+	for _, c := range m.calls[i] {
+		ch <- c
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (m *scriptedStreamChat) GetModelName() string { return "mock" }
+func (m *scriptedStreamChat) GetModelID() string   { return "mock" }
+
+func truncatedEmptyStream() []types.StreamResponse {
+	return []types.StreamResponse{
+		{ResponseType: types.ResponseTypeThinking, Content: "planning"},
+		{ResponseType: types.ResponseTypeThinking, Done: true},
+		{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "length"},
+	}
 }
 
 // TestStreamDropsIncompleteHandleOnCancel verifies that cancellation cannot
@@ -281,4 +318,95 @@ func TestStreamReportsIncompleteAsError(t *testing.T) {
 	for _, answer := range bus.finalAnswerEvents() {
 		require.False(t, answer.Done, "a cut-off stream must not close the answer as complete")
 	}
+}
+
+// TestStreamRetriesEmptyLengthTruncation verifies that a budget exhausted
+// inside thinking with no answer text is retried once with a raised,
+// thinking-free budget instead of surfacing the fallback immediately.
+func TestStreamRetriesEmptyLengthTruncation(t *testing.T) {
+	bus := &syncEventBus{}
+	model := &scriptedStreamChat{calls: [][]types.StreamResponse{
+		truncatedEmptyStream(),
+		{
+			{ResponseType: types.ResponseTypeAnswer, Content: "the real answer"},
+			{ResponseType: types.ResponseTypeAnswer, Done: true, FinishReason: "stop"},
+		},
+	}}
+
+	chatManage := &types.ChatManage{}
+	chatManage.SessionID = "sess-empty-length-retry"
+	chatManage.EventBus = bus
+	plugin := &PluginChatCompletionStream{modelService: &stubModelService{model: model}}
+	require.Nil(t, plugin.OnEvent(
+		context.Background(), types.CHAT_COMPLETION_STREAM, chatManage,
+		func() *PluginError { return nil },
+	))
+
+	require.Eventually(t, func() bool { return len(model.opts) == 2 }, 2*time.Second, 5*time.Millisecond)
+	// The retry must drop thinking and raise the budget to the floor.
+	retryOpt := model.opts[1]
+	require.Equal(t, emptyAnswerRetryFloorTokens, retryOpt.CompletionBudget())
+	require.Equal(t, api.ReasoningOff, retryOpt.ReasoningEffort)
+	require.NotNil(t, retryOpt.Thinking)
+	require.False(t, *retryOpt.Thinking)
+
+	require.Eventually(t, func() bool { return len(bus.finalAnswerEvents()) >= 1 }, 2*time.Second, 5*time.Millisecond)
+	// The answer may arrive split across chunks (the stream decoder bridges
+	// partial reference prefixes), so assert on the joined content.
+	answers := bus.finalAnswerEvents()
+	var joined string
+	for _, a := range answers {
+		joined += a.Content
+	}
+	require.Equal(t, "the real answer", joined)
+	require.True(t, answers[len(answers)-1].Done)
+	require.False(t, answers[len(answers)-1].Truncated)
+	require.NotContains(t, joined, EmptyTruncatedAnswerFallback)
+}
+
+// TestStreamRetryStillTruncatedFallsBack verifies the fallback is emitted when
+// even the raised, thinking-free retry ends truncated with no answer text.
+func TestStreamRetryStillTruncatedFallsBack(t *testing.T) {
+	bus := &syncEventBus{}
+	model := &scriptedStreamChat{calls: [][]types.StreamResponse{
+		truncatedEmptyStream(),
+		truncatedEmptyStream(),
+	}}
+
+	chatManage := &types.ChatManage{}
+	chatManage.SessionID = "sess-empty-length-retry-fallback"
+	chatManage.EventBus = bus
+	plugin := &PluginChatCompletionStream{modelService: &stubModelService{model: model}}
+	require.Nil(t, plugin.OnEvent(
+		context.Background(), types.CHAT_COMPLETION_STREAM, chatManage,
+		func() *PluginError { return nil },
+	))
+
+	require.Eventually(t, func() bool { return len(model.opts) == 2 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(bus.finalAnswerEvents()) == 1 }, 2*time.Second, 5*time.Millisecond)
+	answers := bus.finalAnswerEvents()
+	require.Equal(t, EmptyTruncatedAnswerFallback, answers[0].Content)
+	require.True(t, answers[0].Done)
+	require.True(t, answers[0].Truncated)
+}
+
+// TestPrepareChatModelLiftsThinkingBudgetFloor verifies a small configured
+// budget is raised when the caller explicitly asked for thinking on, and left
+// untouched otherwise.
+func TestPrepareChatModelLiftsThinkingBudgetFloor(t *testing.T) {
+	thinkingOn := true
+	modelService := &stubModelService{model: &openStreamChat{}}
+
+	chatManage := &types.ChatManage{}
+	chatManage.SummaryConfig.MaxCompletionTokens = 1024
+	chatManage.SummaryConfig.Thinking = &thinkingOn
+
+	_, opt, err := prepareChatModel(context.Background(), modelService, chatManage)
+	require.Nil(t, err)
+	require.Equal(t, thinkingCompletionFloorTokens, opt.CompletionBudget())
+
+	chatManage.SummaryConfig.Thinking = nil
+	_, opt, err = prepareChatModel(context.Background(), modelService, chatManage)
+	require.Nil(t, err)
+	require.Equal(t, 1024, opt.CompletionBudget())
 }

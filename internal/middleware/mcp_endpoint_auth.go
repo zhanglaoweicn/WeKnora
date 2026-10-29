@@ -25,7 +25,7 @@ func MCPEndpointAuth(svc interfaces.MCPEndpointService, tenantSvc interfaces.Ten
 		endpointID := strings.TrimSpace(c.Param("endpoint_id"))
 		token := extractMCPEndpointToken(c)
 		if endpointID == "" || token == "" {
-			c.Header("WWW-Authenticate", `Bearer realm="weknora-mcp"`)
+			c.Header("WWW-Authenticate", `Bearer realm="linkmind-mcp"`)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: missing bearer token"})
 			c.Abort()
 			return
@@ -36,7 +36,7 @@ func MCPEndpointAuth(svc interfaces.MCPEndpointService, tenantSvc interfaces.Ten
 			case errors.Is(err, service.ErrMCPEndpointDisabled):
 				c.JSON(http.StatusForbidden, gin.H{"error": "mcp endpoint disabled"})
 			case errors.Is(err, service.ErrMCPEndpointTokenInvalid), errors.Is(err, service.ErrMCPEndpointNotFound):
-				c.Header("WWW-Authenticate", `Bearer realm="weknora-mcp"`)
+				c.Header("WWW-Authenticate", `Bearer realm="linkmind-mcp"`)
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: invalid token"})
 			default:
 				logger.Warnf(c.Request.Context(), "[mcp-endpoint] auth lookup failed: %v", err)
