@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **FIXED**: **SSRF 防护不再拦截代理 Fake-IP 网段（可选）** — 新增环境变量 `SSRF_ALLOW_FAKEIP`：开启后放行 198.18.0.0/15（RFC 2544 基准测试段，Clash/mihomo/Surge 类代理 Fake-IP 模式的默认 DNS 应答段）。此前开代理的用户保存任何云端模型、导入任何网页都会被 SSRF 校验拦截且无从排查；该段不可路由、无 SSRF 可触达的基础设施，localhost/内网/云元数据仍全部拦截。服务器部署不设置该变量，行为不变。被拦时的报错也改为中文指引（点明 Fake-IP 成因与处理步骤），Go 侧校验、拨号与 docreader Python 守卫口径一致。
+- **FIXED**: **桌面壳日志管道断裂不再刷屏** — 桌面壳读取后端 stdout 的线程此前遇一次读错误即退出并丢弃管道读取端，之后后端每写一行日志都得到 EPIPE，logrus 向 stderr 持续打印 "Failed to write to log, write /dev/stdout: The pipe is being closed." 把服务日志面板刷满。两端各加固一处：壳保持管道存活（提示一次后每秒重试）；后端日志输出在 stdout 首次写失败后自动降级到 stderr（面板继续可见、日志文件不受影响）。
+- **FIXED**: **`/health` 探活请求不再产生访问日志** — 桌面壳秒级轮询健康检查的日志此前持续刷日志面板与文件。
+
 ## [0.8.2] - 2026-09-24
 
 ### New Features

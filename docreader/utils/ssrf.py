@@ -93,6 +93,30 @@ _IP_LIKE_PATTERNS = (
     re.compile(r"(?i)^[0-9a-f]{1,4}(:[0-9a-f]{1,4}){7}$"),
 )
 
+# RFC 2544 benchmarking block: non-routable, and the default Fake-IP answer
+# range of Clash/mihomo/Surge class proxies. Blocked like any other reserved
+# range unless SSRF_ALLOW_FAKEIP opts out (mirrors internal/utils/security.go).
+FAKEIP_CIDR = ipaddress.ip_network("198.18.0.0/15")
+
+FAKEIP_HINT = (
+    "检测到该域名解析到 198.18.0.0/15 网段：这通常是本机 VPN/代理软件(Clash/Verge 等)的 Fake-IP 模式所致。"
+    "请退出代理软件或切换为普通模式后重试；桌面版也可保持代理开启(已默认兼容)。"
+)
+
+
+def _fakeip_allowed() -> bool:
+    """Whether SSRF_ALLOW_FAKEIP lets 198.18.0.0/15 through.
+
+    Behind a Fake-IP proxy the local DNS answer is a placeholder: the proxy's
+    TUN adapter owns the real resolution and connection, and the range hosts
+    no infrastructure an SSRF could reach. The desktop shell injects this
+    variable as true by default; server deployments leave it unset.
+    """
+    raw = os.environ.get("SSRF_ALLOW_FAKEIP", "").strip()
+    if not raw:
+        return False
+    return raw.lower() not in {"0", "f", "false", "no", "off"}
+
 
 def _normalize_url(raw_url: str) -> str:
     if "://" not in raw_url:
@@ -161,7 +185,13 @@ def _is_ip_like_hostname(hostname: str) -> bool:
 
 
 def _is_restricted_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> Optional[str]:
+    if isinstance(ip, ipaddress.IPv4Address) and ip in FAKEIP_CIDR and _fakeip_allowed():
+        return None
     if ip.is_private:
+        # 198.18.0.0/15 counts as private on Python >= 3.11; give it the
+        # dedicated Fake-IP explanation instead of the generic reason.
+        if isinstance(ip, ipaddress.IPv4Address) and ip in FAKEIP_CIDR:
+            return FAKEIP_HINT
         return "private IP address"
     if ip.is_loopback:
         return "loopback address"
@@ -174,6 +204,8 @@ def _is_restricted_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -
     if isinstance(ip, ipaddress.IPv4Address):
         for net in EXTRA_RESTRICTED_CIDRS:
             if isinstance(net, ipaddress.IPv4Network) and ip in net:
+                if net == FAKEIP_CIDR:
+                    return FAKEIP_HINT
                 return f"restricted range {net}"
     if isinstance(ip, ipaddress.IPv6Address):
         embedded_ipv4 = ip.ipv4_mapped

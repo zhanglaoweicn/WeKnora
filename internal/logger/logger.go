@@ -28,6 +28,50 @@ var (
 	ansiEscapeRE  = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 )
 
+// pipeResilientWriter 保证 stdout 管道断裂后日志仍然可见。
+//
+// 桌面壳通过管道读取本进程 stdout；壳侧一旦停止读取（历史缺陷）或外部安全
+// 软件干预管道，每次写 stdout 都会返回 EPIPE。logrus 收到写错误后会向
+// stderr 打印 "Failed to write to log, write /dev/stdout: The pipe is being
+// closed."——由于壳的 stderr 采集线程通常仍然存活，服务日志面板会被这条
+// 抱怨按请求频率刷屏，真实日志反而被淹没。
+//
+// 首次写失败时把输出永久降级到 fallback（stderr，桌面面板同样展示），并对
+// logrus 返回成功，既不丢日志也不触发它的错误通道；仅打印一条一次性提示。
+// extra 里的旁路输出（日志文件）不受 stdout 断裂影响，始终尽力写入。
+type pipeResilientWriter struct {
+	mu       sync.Mutex
+	primary  io.Writer
+	fallback io.Writer
+	extra    []io.Writer
+	degraded bool
+}
+
+func (w *pipeResilientWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, e := range w.extra {
+		_, _ = e.Write(p)
+	}
+
+	dst := w.primary
+	if w.degraded {
+		dst = w.fallback
+	}
+	n, err := dst.Write(p)
+	if err == nil {
+		return n, nil
+	}
+	if !w.degraded {
+		w.degraded = true
+		fmt.Fprintf(w.fallback,
+			"logger: 标准输出不可用(%v)，日志已自动改经 stderr 输出，无需处理\n", err)
+		n, err = w.fallback.Write(p)
+	}
+	return n, err
+}
+
 // ansiStripWriter removes ANSI color/style sequences so file logs stay plain text
 // while stdout can still render colors in a terminal.
 type ansiStripWriter struct {
@@ -247,7 +291,7 @@ func ConfigureFromEnv() {
 	logLevel := getLogLevelFromEnv()
 	appLogger.SetLevel(logLevel)
 
-	writer := io.Writer(os.Stdout)
+	writer := &pipeResilientWriter{primary: os.Stdout, fallback: os.Stderr}
 	logPath := resolveLogPathFromEnv()
 	if logPath != "" {
 		file, err := openLogFile(logPath)
@@ -255,7 +299,8 @@ func ConfigureFromEnv() {
 			fmt.Fprintf(os.Stderr, "logger: failed to open log file %s: %v\n", logPath, err)
 		} else {
 			activeLogFile = file
-			writer = io.MultiWriter(os.Stdout, &ansiStripWriter{w: file})
+			// 文件走旁路输出：stdout 断裂只影响面板流，落盘不受影响
+			writer.extra = []io.Writer{&ansiStripWriter{w: file}}
 		}
 	}
 

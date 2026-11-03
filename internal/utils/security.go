@@ -291,10 +291,79 @@ func isRestrictedIP(ip net.IP) (bool, string) {
 	return true, reason
 }
 
+// fakeIPRange is 198.18.0.0/15, the RFC 2544 benchmarking block. It is
+// reserved for equipment benchmarking and never routed on the public
+// internet — which is exactly why Clash / mihomo / Surge class proxy clients
+// hand out addresses from it as Fake-IP DNS answers: every hostname the
+// machine resolves looks like 198.18.x.x while the proxy's TUN adapter
+// completes the real connection.
+var fakeIPRange = mustCIDR15("198.18.0.0/15")
+
+func mustCIDR15(s string) *net.IPNet {
+	_, ipNet, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(fmt.Sprintf("security: invalid CIDR %s: %v", s, err))
+	}
+	return ipNet
+}
+
+// isFakeIP reports whether ip falls in the proxy Fake-IP range.
+func isFakeIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return fakeIPRange.Contains(ip4)
+	}
+	return false
+}
+
+// ssrfAllowFakeIP reports whether SSRF_ALLOW_FAKEIP opts the deployment out
+// of blocking the 198.18.0.0/15 benchmark range.
+//
+// Rationale for the desktop default-on: the range is non-routable and hosts
+// no infrastructure an SSRF could profitably reach (cloud metadata, LAN
+// services and localhost all live elsewhere and remain blocked). Behind a
+// Fake-IP proxy the local resolution result is meaningless anyway — the
+// proxy owns the real name resolution — and every outbound model call or URL
+// import otherwise fails for the user with no way to self-diagnose. Server
+// deployments leave the variable unset and keep the strict behaviour.
+func ssrfAllowFakeIP() bool {
+	raw := strings.TrimSpace(os.Getenv("SSRF_ALLOW_FAKEIP"))
+	if raw == "" {
+		return false
+	}
+	switch strings.ToLower(raw) {
+	case "0", "f", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// fakeIPHint is the user-facing guidance appended when a hostname resolves
+// into the Fake-IP range and the range is not allowed. It names the cause
+// (a VPN/proxy in Fake-IP mode) and the exact remediation steps so a
+// non-technical user can act without contacting support.
+const fakeIPHint = "检测到该域名解析到 198.18.0.0/15 网段：这通常是本机 VPN/代理软件(Clash/Verge 等)的 Fake-IP 模式所致。" +
+	"请退出代理软件或切换为普通模式后重试；桌面版也可保持代理开启(已默认兼容)。"
+
+// checkResolvedIP is the single verdict used by URL validation and the dial
+// path: restricted-or-not plus a reason. Fake-IP addresses get their own
+// branch so the allow switch and the dedicated hint apply consistently.
+func checkResolvedIP(ip net.IP) (bool, string) {
+	if isFakeIP(ip) {
+		if ssrfAllowFakeIP() {
+			return false, ""
+		}
+		return true, fakeIPHint
+	}
+	return isRestrictedIP(ip)
+}
+
 // IsPublicIP returns true if the IP is safe for outbound fetch (not private, loopback, link-local, etc.).
 // Used for DNS pinning: after resolving a hostname we pick the first public IP and pin all requests to it.
+// Shares the Fake-IP switch with the rest of the SSRF boundary so a proxy
+// client's 198.18.0.0/15 answers do not fail Go-side fetches either.
 func IsPublicIP(ip net.IP) bool {
-	restricted, _ := isRestrictedIP(ip)
+	restricted, _ := checkResolvedIP(ip)
 	return !restricted
 }
 
@@ -407,7 +476,7 @@ func isSSRFSafeURL(rawURL string) (bool, string) {
 
 	// Check if any resolved IP is restricted
 	for _, resolvedIP := range ips {
-		if restricted, reason := isRestrictedIP(resolvedIP); restricted {
+		if restricted, reason := checkResolvedIP(resolvedIP); restricted {
 			return false, fmt.Sprintf("hostname %s resolves to restricted IP %s: %s", hostname, resolvedIP.String(), reason)
 		}
 	}
@@ -913,7 +982,7 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 
 	// Validate all resolved IPs
 	for _, ipAddr := range ips {
-		if restricted, reason := isRestrictedIP(ipAddr.IP); restricted {
+		if restricted, reason := checkResolvedIP(ipAddr.IP); restricted {
 			return nil, fmt.Errorf("connection blocked: %s resolves to restricted IP %s (%s)", host, ipAddr.IP.String(), reason)
 		}
 	}
@@ -1288,17 +1357,23 @@ func FormatSSRFError(label, rawURL string, err error) string {
 	if errors.Is(err, ErrSSRFHostNotWhitelisted) {
 		return fmt.Sprintf(
 			"%s 未通过安全校验：服务端开启了「仅允许白名单出站」（SSRF_DNS_WHITELIST_ONLY），"+
-				"%s 不在白名单内，因此在解析域名之前就被拒绝。如该地址确实可信，请联系运维把它加入 "+
-				"SSRF_WHITELIST_EXTRA（支持精确域名 / *.example.com 通配 / IP / CIDR），"+
-				"示例：SSRF_WHITELIST_EXTRA=%s,*.example.com,10.0.0.0/8",
-			label, host, host,
+				"%s 不在白名单内，因此在解析域名之前就被拒绝。处理方法：把该主机加入白名单 "+
+				"SSRF_WHITELIST_EXTRA（支持精确域名 / *.example.com 通配 / IP / CIDR）——"+
+				"桌面版在 应用设置 → 附加环境变量 添加一行 SSRF_WHITELIST_EXTRA=%s 后重启服务；"+
+				"服务器版请联系运维在服务端环境变量中添加，示例：SSRF_WHITELIST_EXTRA=%s,*.example.com,10.0.0.0/8",
+			label, host, host, host,
 		)
 	}
+	// Fake-IP 等原因自带完整的中文处理指引，直接透出，避免叠加两段话术
+	if msg := err.Error(); strings.Contains(msg, fakeIPHint) || strings.Contains(msg, "Fake-IP") {
+		return fmt.Sprintf("%s 未通过安全校验：%s", label, msg)
+	}
 	return fmt.Sprintf(
-		"%s 未通过安全校验：%v。如该地址确实可信，请联系运维在服务端环境变量 "+
-			"SSRF_WHITELIST_EXTRA 中加入该主机（支持精确域名 / *.example.com 通配 / IP / CIDR），"+
+		"%s 未通过安全校验：%v。处理方法：把该主机加入 SSRF_WHITELIST_EXTRA（支持精确域名 / "+
+			"*.example.com 通配 / IP / CIDR）——桌面版在 应用设置 → 附加环境变量 添加一行 "+
+			"SSRF_WHITELIST_EXTRA=%s 后重启服务；服务器版请联系运维在服务端环境变量中添加，"+
 			"示例：SSRF_WHITELIST_EXTRA=%s,*.example.com,10.0.0.0/8",
-		label, err, host,
+		label, err, host, host,
 	)
 }
 

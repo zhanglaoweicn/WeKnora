@@ -183,7 +183,9 @@ func Logger() gin.HandlerFunc {
 		raw := c.Request.URL.RawQuery
 
 		isWikiStats := strings.HasPrefix(path, "/api/v1/knowledgebase/") && strings.HasSuffix(path, "/wiki/stats")
-		if strings.HasPrefix(path, "/assets/") || isWikiStats {
+		// /health 是桌面壳秒级轮询的探活接口，访问日志只会淹没真实问题
+		isHealthProbe := path == "/health"
+		if strings.HasPrefix(path, "/assets/") || isWikiStats || isHealthProbe {
 			c.Next()
 			return
 		}
